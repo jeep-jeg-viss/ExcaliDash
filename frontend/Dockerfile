@@ -30,8 +30,6 @@ RUN apk add --no-cache gettext
 
 # Copy nginx config template (will be processed at runtime)
 COPY frontend/nginx.conf.template /etc/nginx/nginx.conf.template
-# Also copy the original as fallback
-COPY frontend/nginx.conf /etc/nginx/nginx.conf
 
 # Copy entrypoint script
 COPY frontend/docker-entrypoint.sh /docker-entrypoint.sh
