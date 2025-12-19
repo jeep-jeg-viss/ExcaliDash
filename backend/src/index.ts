@@ -10,7 +10,6 @@ import { Worker } from "worker_threads";
 import multer from "multer";
 import archiver from "archiver";
 import { z } from "zod";
-// @ts-ignore
 import { PrismaClient, Prisma } from "./generated/client";
 import {
   sanitizeDrawingData,
@@ -23,8 +22,6 @@ import {
 
 dotenv.config();
 
-// Ensure DATABASE_URL always points to an absolute path when using SQLite.
-// Respect externally provided values and only fall back to the dev database when unset.
 const backendRoot = path.resolve(__dirname, "../");
 const defaultDbPath = path.resolve(backendRoot, "prisma/dev.db");
 const resolveDatabaseUrl = (rawUrl?: string) => {
@@ -46,6 +43,16 @@ const resolveDatabaseUrl = (rawUrl?: string) => {
 
 process.env.DATABASE_URL = resolveDatabaseUrl(process.env.DATABASE_URL);
 console.log("Resolved DATABASE_URL:", process.env.DATABASE_URL);
+
+// Helper to get the resolved database file path
+const getResolvedDbPath = (): string => {
+  const dbUrl = process.env.DATABASE_URL || `file:${defaultDbPath}`;
+  if (dbUrl.startsWith("file:")) {
+    return dbUrl.replace(/^file:/, "");
+  }
+  // Fallback to default for non-file URLs (e.g., Postgres)
+  return defaultDbPath;
+};
 
 const normalizeOrigins = (rawOrigins?: string | null): string[] => {
   const fallback = "http://localhost:6767";
@@ -79,7 +86,6 @@ const moveFile = async (source: string, destination: string) => {
       throw error;
     }
 
-    // Cross-device rename fallback: copy then delete source
     await fsPromises
       .unlink(destination)
       .catch((unlinkError: NodeJS.ErrnoException) => {
@@ -93,7 +99,6 @@ const moveFile = async (source: string, destination: string) => {
   }
 };
 
-// Initialize upload directory asynchronously
 const initializeUploadDir = async () => {
   try {
     await fsPromises.mkdir(uploadDir, { recursive: true });
@@ -109,7 +114,7 @@ const io = new Server(httpServer, {
     origin: allowedOrigins,
     credentials: true,
   },
-  maxHttpBufferSize: 1e8, // 100 MB
+  maxHttpBufferSize: 1e8,
 });
 const prisma = new PrismaClient();
 const parseJsonField = <T>(
@@ -138,11 +143,6 @@ const DRAWINGS_CACHE_TTL_MS = (() => {
 type DrawingsCacheEntry = { body: Buffer; expiresAt: number };
 const drawingsCache = new Map<string, DrawingsCacheEntry>();
 
-/**
- * Builds a cache key for the drawings list endpoint.
- * NOTE: This key does NOT include sort order. If sorting options are added
- * to the endpoint in the future, they must be included in this key.
- */
 const buildDrawingsCacheKey = (keyParts: {
   searchTerm: string;
   collectionFilter: string;
@@ -177,7 +177,6 @@ const invalidateDrawingsCache = () => {
   drawingsCache.clear();
 };
 
-// Cleanup cache every 60 seconds
 setInterval(() => {
   const now = Date.now();
   for (const [key, entry] of drawingsCache.entries()) {
@@ -185,19 +184,17 @@ setInterval(() => {
       drawingsCache.delete(key);
     }
   }
-}, 60_000).unref(); // unref so it doesn't keep the process alive if everything else stops
+}, 60_000).unref();
 
 const PORT = process.env.PORT || 8000;
 
-// Multer setup for file uploads with streaming support
 const upload = multer({
   dest: uploadDir,
   limits: {
-    fileSize: 100 * 1024 * 1024, // 100MB limit
-    files: 1, // Only one file per upload
+    fileSize: 100 * 1024 * 1024,
+    files: 1,
   },
   fileFilter: (req, file, cb) => {
-    // Only allow SQLite database extensions for database imports
     if (file.fieldname === "db") {
       const isSqliteDb =
         file.originalname.endsWith(".db") ||
@@ -219,7 +216,6 @@ app.use(
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
-// Log large requests for monitoring and debugging
 app.use((req, res, next) => {
   const contentLength = req.headers["content-length"];
   if (contentLength) {
@@ -235,7 +231,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Security middleware - Add security headers
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
@@ -246,7 +241,6 @@ app.use((req, res, next) => {
     "geolocation=(), microphone=(), camera=()"
   );
 
-  // Content Security Policy - restrict sources
   res.setHeader(
     "Content-Security-Policy",
     "default-src 'self'; " +
@@ -261,11 +255,9 @@ app.use((req, res, next) => {
   next();
 });
 
-// Rate limiting middleware (basic implementation)
 const requestCounts = new Map<string, { count: number; resetTime: number }>();
-const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
+const RATE_LIMIT_WINDOW = 15 * 60 * 1000;
 
-// Cleanup rate limit map every 5 minutes
 setInterval(() => {
   const now = Date.now();
   for (const [ip, data] of requestCounts.entries()) {
@@ -281,7 +273,7 @@ const RATE_LIMIT_MAX_REQUESTS = (() => {
     return 1000;
   }
   return parsed;
-})(); // Max requests per window
+})();
 
 app.use((req, res, next) => {
   const ip = req.ip || req.connection.remoteAddress || "unknown";
@@ -315,7 +307,6 @@ const drawingBaseSchema = z.object({
   preview: z.string().nullable().optional(),
 });
 
-// Use strict schemas from security module with sanitization
 const drawingCreateSchema = drawingBaseSchema
   .extend({
     elements: elementSchema.array().default([]),
@@ -324,10 +315,8 @@ const drawingCreateSchema = drawingBaseSchema
   })
   .refine(
     (data) => {
-      // Apply sanitization before database persistence
       try {
         const sanitized = sanitizeDrawingData(data);
-        // Merge sanitized data back with original properties
         Object.assign(data, sanitized);
         return true;
       } catch (error) {
@@ -348,9 +337,7 @@ const drawingUpdateSchema = drawingBaseSchema
   })
   .refine(
     (data) => {
-      // Apply sanitization before database persistence
       try {
-        // Only sanitize provided fields
         const sanitizedData = { ...data };
         if (data.elements !== undefined || data.appState !== undefined) {
           const fullData = {
@@ -375,8 +362,6 @@ const drawingUpdateSchema = drawingBaseSchema
         return true;
       } catch (error) {
         console.error("Sanitization failed:", error);
-        // For updates, if sanitization fails but we have minimal data, allow it to pass
-        // This prevents legitimate empty drawings from failing
         if (
           data.elements === undefined &&
           data.appState === undefined &&
@@ -416,8 +401,6 @@ const validateSqliteHeader = (filePath: string): boolean => {
       return false;
     }
 
-    // SQLite format 3 header: "SQLite format 3\0" (16 bytes)
-    // Hex: 53 51 4c 69 74 65 20 66 6f 72 6d 61 74 20 33 00
     const expectedHeader = Buffer.from([
       0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6f, 0x72, 0x6d, 0x61,
       0x74, 0x20, 0x33, 0x00,
@@ -438,7 +421,6 @@ const validateSqliteHeader = (filePath: string): boolean => {
     return false;
   }
 };
-// Non-blocking CPU check using worker threads while still verifying headers
 const verifyDatabaseIntegrityAsync = (filePath: string): Promise<boolean> => {
   if (!validateSqliteHeader(filePath)) {
     return Promise.resolve(false);
@@ -476,7 +458,7 @@ const verifyDatabaseIntegrityAsync = (filePath: string): Promise<boolean> => {
       console.warn("Integrity check worker timed out", { filePath });
       worker.terminate();
       finish(false);
-    }, 10000); // 10 second timeout
+    }, 10000);
   });
 };
 
@@ -484,7 +466,6 @@ const removeFileIfExists = async (filePath?: string) => {
   if (!filePath) return;
   try {
     await fsPromises.access(filePath).catch(() => {
-      // File doesn't exist, nothing to remove
       return;
     });
     await fsPromises.unlink(filePath);
@@ -493,7 +474,6 @@ const removeFileIfExists = async (filePath?: string) => {
   }
 };
 
-// Socket.io Logic
 interface User {
   id: string;
   name: string;
@@ -531,8 +511,6 @@ io.on("connection", (socket) => {
 
   socket.on("cursor-move", (data) => {
     const roomId = `drawing_${data.drawingId}`;
-    // Use volatile for high-frequency, low-importance updates (cursors)
-    // If network is congested, drop these packets
     socket.volatile.to(roomId).emit("cursor-move", data);
   });
 
@@ -568,14 +546,10 @@ io.on("connection", (socket) => {
   });
 });
 
-// Health check endpoint
 app.get("/health", (req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
-// --- Drawings ---
-
-// GET /drawings
 app.get("/drawings", async (req, res) => {
   try {
     const { search, collectionId, includeData } = req.query;
@@ -598,7 +572,6 @@ app.get("/drawings", async (req, res) => {
       where.collectionId = normalizedCollectionId;
       collectionFilterKey = `id:${normalizedCollectionId}`;
     } else {
-      // Default: Exclude trash, but include unorganized (null)
       where.OR = [{ collectionId: { not: "trash" } }, { collectionId: null }];
     }
 
@@ -662,7 +635,6 @@ app.get("/drawings", async (req, res) => {
   }
 });
 
-// GET /drawings/:id
 app.get("/drawings/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -673,18 +645,6 @@ app.get("/drawings/:id", async (req, res) => {
       console.warn("[API] Drawing not found", { id });
       return res.status(404).json({ error: "Drawing not found" });
     }
-
-    console.log("[API] Returning drawing", {
-      id,
-      elementCount: (() => {
-        try {
-          const parsed = JSON.parse(drawing.elements);
-          return Array.isArray(parsed) ? parsed.length : null;
-        } catch (_err) {
-          return null;
-        }
-      })(),
-    });
 
     res.json({
       ...drawing,
@@ -697,10 +657,8 @@ app.get("/drawings/:id", async (req, res) => {
   }
 });
 
-// POST /drawings
 app.post("/drawings", async (req, res) => {
   try {
-    // Additional security validation for imported data
     const isImportedDrawing = req.headers["x-imported-file"] === "true";
 
     if (isImportedDrawing && !validateImportedDrawing(req.body)) {
@@ -745,23 +703,9 @@ app.post("/drawings", async (req, res) => {
   }
 });
 
-// PUT /drawings/:id
 app.put("/drawings/:id", async (req, res) => {
   try {
     const { id } = req.params;
-
-    console.log("[API] Update request received", {
-      id,
-      bodyKeys: Object.keys(req.body || {}),
-      hasElements: req.body?.elements !== undefined,
-      elementCount: Array.isArray(req.body?.elements)
-        ? req.body.elements.length
-        : undefined,
-      hasAppState: req.body?.appState !== undefined,
-      appStateKeys: req.body?.appState ? Object.keys(req.body.appState) : [],
-      hasFiles: req.body?.files !== undefined,
-      hasPreview: req.body?.preview !== undefined,
-    });
 
     const parsed = drawingUpdateSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -779,17 +723,6 @@ app.put("/drawings/:id", async (req, res) => {
     }
 
     const payload = parsed.data;
-
-    console.log("[API] Updating drawing", {
-      id,
-      hasElements: payload.elements !== undefined,
-      elementCount: Array.isArray(payload.elements)
-        ? payload.elements.length
-        : undefined,
-      hasAppState: payload.appState !== undefined,
-      hasFiles: payload.files !== undefined,
-      hasPreview: payload.preview !== undefined,
-    });
 
     const data: any = {
       version: { increment: 1 },
@@ -811,18 +744,6 @@ app.put("/drawings/:id", async (req, res) => {
     });
     invalidateDrawingsCache();
 
-    console.log("[API] Update complete", {
-      id,
-      storedElementCount: (() => {
-        try {
-          const parsed = JSON.parse(updatedDrawing.elements);
-          return Array.isArray(parsed) ? parsed.length : null;
-        } catch (_err) {
-          return null;
-        }
-      })(),
-    });
-
     res.json({
       ...updatedDrawing,
       elements: JSON.parse(updatedDrawing.elements),
@@ -835,7 +756,6 @@ app.put("/drawings/:id", async (req, res) => {
   }
 });
 
-// DELETE /drawings/:id
 app.delete("/drawings/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -847,7 +767,6 @@ app.delete("/drawings/:id", async (req, res) => {
   }
 });
 
-// POST /drawings/:id/duplicate
 app.post("/drawings/:id/duplicate", async (req, res) => {
   try {
     const { id } = req.params;
@@ -880,9 +799,6 @@ app.post("/drawings/:id/duplicate", async (req, res) => {
   }
 });
 
-// --- Collections ---
-
-// GET /collections
 app.get("/collections", async (req, res) => {
   try {
     const collections = await prisma.collection.findMany({
@@ -895,7 +811,6 @@ app.get("/collections", async (req, res) => {
   }
 });
 
-// POST /collections
 app.post("/collections", async (req, res) => {
   try {
     const { name } = req.body;
@@ -908,7 +823,6 @@ app.post("/collections", async (req, res) => {
   }
 });
 
-// PUT /collections/:id
 app.put("/collections/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -923,12 +837,9 @@ app.put("/collections/:id", async (req, res) => {
   }
 });
 
-// DELETE /collections/:id
 app.delete("/collections/:id", async (req, res) => {
   try {
     const { id } = req.params;
-
-    // Transaction: Unlink drawings, then delete collection
     await prisma.$transaction([
       prisma.drawing.updateMany({
         where: { collectionId: id },
@@ -946,9 +857,6 @@ app.delete("/collections/:id", async (req, res) => {
   }
 });
 
-// --- Library ---
-
-// GET /library - Fetch stored library items
 app.get("/library", async (req, res) => {
   try {
     const library = await prisma.library.findUnique({
@@ -956,7 +864,6 @@ app.get("/library", async (req, res) => {
     });
 
     if (!library) {
-      // Return empty array if no library exists yet
       return res.json({ items: [] });
     }
 
@@ -969,7 +876,6 @@ app.get("/library", async (req, res) => {
   }
 });
 
-// PUT /library - Update/create library items
 app.put("/library", async (req, res) => {
   try {
     const { items } = req.body;
@@ -998,9 +904,6 @@ app.put("/library", async (req, res) => {
   }
 });
 
-// --- Export/Import Endpoints ---
-
-// GET /export - Export SQLite database (supports .sqlite and .db extensions)
 app.get("/export", async (req, res) => {
   try {
     const formatParam =
@@ -1008,7 +911,7 @@ app.get("/export", async (req, res) => {
         ? req.query.format.toLowerCase()
         : undefined;
     const extension = formatParam === "db" ? "db" : "sqlite";
-    const dbPath = path.resolve(__dirname, "../prisma/dev.db");
+    const dbPath = getResolvedDbPath();
 
     try {
       await fsPromises.access(dbPath);
@@ -1032,7 +935,6 @@ app.get("/export", async (req, res) => {
   }
 });
 
-// GET /export/json - Export drawings as ZIP of .excalidraw files
 app.get("/export/json", async (req, res) => {
   try {
     const drawings = await prisma.drawing.findMany({
@@ -1058,7 +960,6 @@ app.get("/export/json", async (req, res) => {
 
     archive.pipe(res);
 
-    // Group drawings by collection
     const drawingsByCollection: { [key: string]: any[] } = {};
 
     drawings.forEach((drawing: any) => {
@@ -1079,10 +980,9 @@ app.get("/export/json", async (req, res) => {
       });
     });
 
-    // Create folders and add files
     Object.entries(drawingsByCollection).forEach(
       ([collectionName, collectionDrawings]) => {
-        const folderName = collectionName.replace(/[<>:"/\\|?*]/g, "_"); // Sanitize folder name
+        const folderName = collectionName.replace(/[<>:"/\\|?*]/g, "_");
         collectionDrawings.forEach((drawing, index) => {
           const fileName = `${drawing.name.replace(
             /[<>:"/\\|?*]/g,
@@ -1097,7 +997,6 @@ app.get("/export/json", async (req, res) => {
       }
     );
 
-    // Add a readme file
     const readmeContent = `ExcaliDash Export
 
 This archive contains your ExcaliDash drawings organized by collection folders.
@@ -1126,7 +1025,6 @@ ${Object.entries(drawingsByCollection)
   }
 });
 
-// POST /import/sqlite/verify - Verify SQLite database before import
 app.post("/import/sqlite/verify", upload.single("db"), async (req, res) => {
   try {
     if (!req.file) {
@@ -1151,7 +1049,6 @@ app.post("/import/sqlite/verify", upload.single("db"), async (req, res) => {
   }
 });
 
-// POST /import/sqlite - Import SQLite database
 app.post("/import/sqlite", upload.single("db"), async (req, res) => {
   try {
     if (!req.file) {
@@ -1181,20 +1078,15 @@ app.post("/import/sqlite", upload.single("db"), async (req, res) => {
         .json({ error: "Uploaded database failed integrity check" });
     }
 
-    const dbPath = path.resolve(__dirname, "../prisma/dev.db");
-    const backupPath = path.resolve(__dirname, "../prisma/dev.db.backup");
+    const dbPath = getResolvedDbPath();
+    const backupPath = `${dbPath}.backup`;
 
     try {
-      // Use async file operations instead of blocking ones
       try {
         await fsPromises.access(dbPath);
-        // Database exists, create backup
         await fsPromises.copyFile(dbPath, backupPath);
-      } catch {
-        // Database doesn't exist, skip backup
-      }
+      } catch {}
 
-      // Move staged file to final location, supporting cross-device mounts
       await moveFile(stagedPath, dbPath);
     } catch (error) {
       console.error("Failed to replace database", error);
@@ -1202,7 +1094,6 @@ app.post("/import/sqlite", upload.single("db"), async (req, res) => {
       return res.status(500).json({ error: "Failed to replace database" });
     }
 
-    // Reinitialize Prisma client
     await prisma.$disconnect();
     invalidateDrawingsCache();
 
@@ -1216,7 +1107,6 @@ app.post("/import/sqlite", upload.single("db"), async (req, res) => {
   }
 });
 
-// Ensure Trash collection exists
 const ensureTrashCollection = async () => {
   try {
     const trash = await prisma.collection.findUnique({
@@ -1234,7 +1124,6 @@ const ensureTrashCollection = async () => {
 };
 
 httpServer.listen(PORT, async () => {
-  // Initialize upload directory asynchronously to avoid blocking startup
   await initializeUploadDir();
   await ensureTrashCollection();
   console.log(`Server running on port ${PORT}`);
