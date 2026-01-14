@@ -27,3 +27,17 @@ CSRF Protection (8a78b2b)
   - Updated docker-compose configurations with new environment variables
   - E2E test suite improvements and reliability fixes
   - Added Kubernetes deployment note in README
+
+### Kubernetes
+
+  A `CSRF_SECRET` environment variable is now required for CSRF protection. Generate a secure 32+ character random string:
+
+  ```bash
+  openssl rand -base64 32
+
+  Add it to your deployment:
+  - Docker Compose: Add CSRF_SECRET=<your-secret> to the backend service environment
+  - Kubernetes: Add to your ConfigMap/Secret and reference in the backend deployment
+
+  If not set, the backend will refuse to start.
+  ```
