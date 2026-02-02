@@ -120,14 +120,17 @@ docker compose up -d
 
 When running ExcaliDash behind Traefik, Nginx, or another reverse proxy, configure both containers so that API + WebSocket calls resolve correctly:
 
-- `FRONTEND_URL` (backend) must match the public URL that users hit (e.g. `https://excalidash.example.com`). This controls CORS and Socket.IO origin checks.
+- `FRONTEND_URL` (backend) must match the public URL that users hit (e.g. `https://excalidash.example.com`). This controls CORS and Socket.IO origin checks. **Supports multiple comma-separated URLs** for accessing from different addresses.
 - `BACKEND_URL` (frontend) tells the Nginx container how to reach the backend from inside Docker/Kubernetes. Override it if your reverse proxy exposes the backend under a different hostname.
 
 ```yaml
 # docker-compose.yml example
 backend:
   environment:
+    # Single URL
     - FRONTEND_URL=https://excalidash.example.com
+    # Or multiple URLs (comma-separated) for local + network access
+    # - FRONTEND_URL=http://localhost:6767,http://192.168.1.100:6767,http://nas.local:6767
 frontend:
   environment:
     # For standard Docker Compose (default)
