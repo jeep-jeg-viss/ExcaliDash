@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { LayoutGrid, Folder, Plus, Trash2, Edit2, Archive, FolderOpen, Settings as SettingsIcon, LogOut, Shield, User } from 'lucide-react';
+import { LayoutGrid, Folder, Plus, Trash2, Edit2, Archive, FolderOpen, Settings as SettingsIcon, LogOut, Shield } from 'lucide-react';
 import type { Collection } from '../types';
 import clsx from 'clsx';
 import { ConfirmModal } from './ConfirmModal';
