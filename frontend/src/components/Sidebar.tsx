@@ -1,10 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { LayoutGrid, Folder, Plus, Trash2, Edit2, Archive, FolderOpen, Settings as SettingsIcon } from 'lucide-react';
+import { LayoutGrid, Folder, Plus, Trash2, Edit2, Archive, FolderOpen, Settings as SettingsIcon, LogOut, Shield, User } from 'lucide-react';
 import type { Collection } from '../types';
 import clsx from 'clsx';
 import { ConfirmModal } from './ConfirmModal';
 import { Logo } from './Logo';
+import { useAuth } from '../context/AuthContext';
 
 interface SidebarProps {
   collections: Collection[];
@@ -109,6 +110,86 @@ const SidebarItem: React.FC<SidebarItemProps> = ({
   );
 };
 
+
+// User Profile Section Component
+const UserProfileSection: React.FC = () => {
+  const navigate = useNavigate();
+  const { user, isAdmin, signOut } = useAuth();
+  const [showMenu, setShowMenu] = useState(false);
+
+  if (!user) return null;
+
+  const initials = user.name
+    ?.split(' ')
+    .map((n) => n[0])
+    .join('')
+    .toUpperCase()
+    .slice(0, 2) || 'U';
+
+  return (
+    <div className="px-3 pt-2 pb-4 border-t border-slate-200/50 dark:border-slate-700/50">
+      <div className="relative">
+        <button
+          onClick={() => setShowMenu(!showMenu)}
+          className="w-full flex items-center gap-3 px-3 py-2.5 text-sm font-bold rounded-xl transition-all duration-200 border-2 border-black dark:border-neutral-700 shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,0.2)] bg-white dark:bg-neutral-900 text-slate-900 dark:text-neutral-200 hover:bg-slate-50 dark:hover:bg-neutral-800 hover:shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[4px_4px_0px_0px_rgba(255,255,255,0.2)] hover:-translate-y-0.5"
+        >
+          <div className={clsx(
+            "w-8 h-8 rounded-full flex items-center justify-center text-white text-xs font-bold",
+            isAdmin ? "bg-indigo-600" : "bg-slate-500"
+          )}>
+            {initials}
+          </div>
+          <div className="flex-1 text-left min-w-0">
+            <div className="truncate">{user.name}</div>
+            {isAdmin && (
+              <div className="text-xs text-indigo-600 dark:text-indigo-400 font-normal">Admin</div>
+            )}
+          </div>
+        </button>
+
+        {/* Dropdown Menu */}
+        {showMenu && (
+          <>
+            <div
+              className="fixed inset-0 z-40"
+              onClick={() => setShowMenu(false)}
+            />
+            <div className="absolute bottom-full left-0 right-0 mb-2 z-50 bg-white dark:bg-neutral-800 rounded-xl border-2 border-black dark:border-neutral-700 shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,0.2)] py-1 overflow-hidden">
+              <div className="px-3 py-2 border-b border-slate-200 dark:border-neutral-700">
+                <div className="text-sm font-bold text-slate-900 dark:text-white truncate">{user.name}</div>
+                <div className="text-xs text-slate-500 dark:text-neutral-400 truncate">{user.email}</div>
+              </div>
+              
+              {isAdmin && (
+                <button
+                  onClick={() => {
+                    setShowMenu(false);
+                    navigate('/admin');
+                  }}
+                  className="w-full px-3 py-2.5 text-sm text-left text-slate-700 dark:text-neutral-300 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 hover:text-indigo-700 dark:hover:text-indigo-300 flex items-center gap-2 font-medium"
+                >
+                  <Shield size={16} />
+                  Admin Dashboard
+                </button>
+              )}
+              
+              <button
+                onClick={() => {
+                  setShowMenu(false);
+                  signOut();
+                }}
+                className="w-full px-3 py-2.5 text-sm text-left text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-900/30 flex items-center gap-2 font-medium"
+              >
+                <LogOut size={16} />
+                Sign Out
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+};
 
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -297,6 +378,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <span className="min-w-0 flex-1 text-left">Settings</span>
           </button>
         </div>
+
+        {/* User Profile Section */}
+        <UserProfileSection />
       </div>
 
       {/* Context Menu */}

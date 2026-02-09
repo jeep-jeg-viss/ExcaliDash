@@ -12,12 +12,100 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ==========================================
+// Better-Auth Models
+// ==========================================
+
+model user {
+  id            String    @id
+  name          String
+  email         String    @unique
+  emailVerified Boolean   @default(false)
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  
+  // Admin plugin fields
+  role          String?   @default("user")
+  banned        Boolean?  @default(false)
+  banReason     String?
+  banExpires    DateTime?
+  
+  // Relations
+  sessions      session[]
+  accounts      account[]
+  
+  // Application data relations
+  drawings      Drawing[]
+  collections   Collection[]
+}
+
+model session {
+  id             String   @id
+  expiresAt      DateTime
+  token          String   @unique
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  ipAddress      String?
+  userAgent      String?
+  userId         String
+  user           user     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // Admin plugin - impersonation
+  impersonatedBy String?
+}
+
+model account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  user      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+}
+
+model verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+// ==========================================
+// Application Settings
+// ==========================================
+
+model AppSettings {
+  id               String   @id @default("default")
+  signupsDisabled  Boolean  @default(false)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+// ==========================================
+// Application Models
+// ==========================================
+
 model Collection {
   id        String    @id @default(uuid())
   name      String
   drawings  Drawing[]
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
+  
+  // User ownership
+  userId    String?
+  user      user?     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
 model Drawing {
@@ -32,6 +120,26 @@ model Drawing {
   collection   Collection? @relation(fields: [collectionId], references: [id])
   createdAt    DateTime    @default(now())
   updatedAt    DateTime    @updatedAt
+  
+  // User ownership
+  userId       String?
+  user         user?       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Share links
+  shareLinks   ShareLink[]
+}
+
+model ShareLink {
+  id          String    @id @default(uuid())
+  token       String    @unique @default(uuid())
+  drawingId   String
+  drawing     Drawing   @relation(fields: [drawingId], references: [id], onDelete: Cascade)
+  createdBy   String    // userId of link creator
+  permission  String    @default("view") // "view" or "edit"
+  expiresAt   DateTime? // null = never expires
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 }
 
 model Library {

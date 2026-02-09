@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Download, Loader2 } from 'lucide-react';
+import { ArrowLeft, Download, Loader2, Share2 } from 'lucide-react';
+import { ShareDialog } from '../components/ShareDialog';
 import { Excalidraw, exportToSvg } from '@excalidraw/excalidraw';
 import '@excalidraw/excalidraw/index.css';
 import debounce from 'lodash/debounce';
@@ -57,6 +58,7 @@ export const Editor: React.FC = () => {
   const [initialData, setInitialData] = useState<any>(null);
   const [isSceneLoading, setIsSceneLoading] = useState(true);
   const [isSavingOnLeave, setIsSavingOnLeave] = useState(false);
+  const [isShareOpen, setIsShareOpen] = useState(false);
 
   useEffect(() => {
     document.title = `${drawingName} - ExcaliDash`;
@@ -76,6 +78,7 @@ export const Editor: React.FC = () => {
   const isUnmounting = useRef(false);
   const isSyncing = useRef(false);
   const cursorBuffer = useRef<Map<string, any>>(new Map());
+  const elementUpdateBuffer = useRef<any[]>([]);
   const animationFrameId = useRef<number>(0);
   const latestElementsRef = useRef<readonly any[]>([]);
   const latestFilesRef = useRef<any>(null);
@@ -107,9 +110,12 @@ export const Editor: React.FC = () => {
   useEffect(() => {
     if (!id || !isReady) return;
 
-    const socketUrl = import.meta.env.VITE_API_URL === '/api'
-      ? window.location.origin
-      : (import.meta.env.VITE_API_URL || 'http://localhost:8000');
+    // Use window.location.origin when API is proxied (relative path or undefined)
+    // Only use VITE_API_URL directly when it's a full URL (http://...)
+    const apiUrl = import.meta.env.VITE_API_URL || '/api';
+    const socketUrl = apiUrl.startsWith('http')
+      ? apiUrl
+      : window.location.origin;
     
     const socket = io(socketUrl, {
       path: '/socket.io',
@@ -117,20 +123,84 @@ export const Editor: React.FC = () => {
     });
     socketRef.current = socket;
 
-    socket.emit('join-room', { drawingId: id, user: me });
+    socket.on('connect', () => {
+      console.log('[Editor] Socket connected:', socket.id, 'joining room:', id);
+      socket.emit('join-room', { drawingId: id, user: me });
+    });
 
-    // Start the render loop for cursors
+    socket.on('connect_error', (err) => {
+      console.error('[Editor] Socket connection error:', err.message);
+    });
+
+    // If already connected (reconnect), join immediately
+    if (socket.connected) {
+      socket.emit('join-room', { drawingId: id, user: me });
+    }
+
+    // Unified render loop: apply buffered element updates + cursor updates per frame
     const renderLoop = () => {
-      if (cursorBuffer.current.size > 0 && excalidrawAPI.current) {
-        const collaborators = new Map(excalidrawAPI.current.getAppState().collaborators || []);
-
-        cursorBuffer.current.forEach((data, userId) => {
-           collaborators.set(userId, data);
-        });
-
-        cursorBuffer.current.clear();
-        excalidrawAPI.current.updateScene({ collaborators });
+      if (!excalidrawAPI.current) {
+        animationFrameId.current = requestAnimationFrame(renderLoop);
+        return;
       }
+
+      const sceneUpdate: any = {};
+
+      // Apply buffered remote element updates
+      if (elementUpdateBuffer.current.length > 0) {
+        isSyncing.current = true;
+
+        const currentAppState = excalidrawAPI.current.getAppState();
+        const mySelectedIds = currentAppState.selectedElementIds || {};
+
+        // Deduplicate: keep latest version of each element across all buffered messages
+        const dedupMap = new Map<string, any>();
+        elementUpdateBuffer.current.forEach((el: any) => {
+          const existing = dedupMap.get(el.id);
+          if (!existing || (el.version ?? 0) > (existing.version ?? 0)) {
+            dedupMap.set(el.id, el);
+          }
+        });
+        elementUpdateBuffer.current = [];
+
+        // Filter out elements user is currently manipulating
+        const remoteElements = Array.from(dedupMap.values()).filter(
+          (el: any) => !mySelectedIds[el.id]
+        );
+
+        if (remoteElements.length > 0) {
+          const localElements = excalidrawAPI.current.getSceneElementsIncludingDeleted();
+          const mergedElements = reconcileElements(localElements, remoteElements);
+
+          remoteElements.forEach((el: any) => recordElementVersion(el));
+
+          sceneUpdate.elements = mergedElements;
+          latestElementsRef.current = mergedElements;
+        }
+      }
+
+      // Apply buffered cursor updates
+      if (cursorBuffer.current.size > 0) {
+        const collaborators = new Map(excalidrawAPI.current.getAppState().collaborators || []);
+        cursorBuffer.current.forEach((data, userId) => {
+          collaborators.set(userId, data);
+        });
+        cursorBuffer.current.clear();
+        sceneUpdate.collaborators = collaborators;
+      }
+
+      // Single updateScene call per frame
+      if (Object.keys(sceneUpdate).length > 0) {
+        excalidrawAPI.current.updateScene(sceneUpdate);
+      }
+
+      // Reset isSyncing after React processes the update (next frame)
+      if (isSyncing.current) {
+        requestAnimationFrame(() => {
+          isSyncing.current = false;
+        });
+      }
+
       animationFrameId.current = requestAnimationFrame(renderLoop);
     };
     renderLoop();
@@ -162,25 +232,8 @@ export const Editor: React.FC = () => {
     });
 
     socket.on('element-update', ({ elements }: { elements: any[] }) => {
-      if (!excalidrawAPI.current) return;
-
-      isSyncing.current = true;
-
-      const currentAppState = excalidrawAPI.current.getAppState();
-      const mySelectedIds = currentAppState.selectedElementIds || {};
-
-      const validRemoteElements = elements.filter((el: any) => !mySelectedIds[el.id]);
-
-      const localElements = excalidrawAPI.current.getSceneElementsIncludingDeleted();
-      const mergedElements = reconcileElements(localElements, validRemoteElements);
-
-      validRemoteElements.forEach((el: any) => {
-        recordElementVersion(el);
-      });
-
-      excalidrawAPI.current.updateScene({ elements: mergedElements });
-      latestElementsRef.current = mergedElements;
-      isSyncing.current = false;
+      // Buffer incoming elements — applied in the rAF render loop
+      elementUpdateBuffer.current.push(...elements);
     });
 
     const handleActivity = (isActive: boolean) => {
@@ -202,6 +255,8 @@ export const Editor: React.FC = () => {
       window.removeEventListener('blur', onBlur);
       document.removeEventListener('mouseenter', onMouseEnter);
       document.removeEventListener('mouseleave', onMouseLeave);
+      socket.off('connect');
+      socket.off('connect_error');
       socket.off('presence-update');
       socket.off('cursor-move');
       socket.off('element-update');
@@ -212,7 +267,7 @@ export const Editor: React.FC = () => {
 
   const onPointerUpdate = useCallback((payload: any) => {
     const now = Date.now();
-    if (now - lastCursorEmit.current > 50 && socketRef.current) {
+    if (now - lastCursorEmit.current > 33 && socketRef.current) {
       socketRef.current.emit('cursor-move', {
         pointer: payload.pointer,
         button: payload.button,
@@ -417,7 +472,7 @@ export const Editor: React.FC = () => {
           userId: me.id
         });
       }
-    }, 100, { leading: true, trailing: true }),
+    }, 50, { leading: true, trailing: true }),
     [id, hasElementChanged, recordElementVersion]
   );
 
@@ -570,17 +625,24 @@ export const Editor: React.FC = () => {
     debouncedSavePreview(allElements, appState, files);
   }, [debouncedSave, debouncedSavePreview, broadcastChanges]);
 
-  const handleRenameSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (newName.trim() && id) {
-      setDrawingName(newName);
+  const commitRename = useCallback(async (name: string) => {
+    const trimmed = name.trim();
+    if (trimmed && id) {
+      setDrawingName(trimmed);
       setIsRenaming(false);
       try {
-        await api.updateDrawing(id, { name: newName });
+        await api.updateDrawing(id, { name: trimmed });
       } catch (err) {
         console.error("Failed to rename", err);
       }
+    } else {
+      setIsRenaming(false);
     }
+  }, [id]);
+
+  const handleRenameSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    commitRename(newName);
   };
 
   // Handle library changes and persist to server
@@ -645,7 +707,8 @@ export const Editor: React.FC = () => {
                 type="text"
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
-                onBlur={() => setIsRenaming(false)}
+                onBlur={() => commitRename(newName)}
+                onKeyDown={(e) => { if (e.key === 'Escape') { setIsRenaming(false); } }}
                 className="font-medium text-gray-900 dark:text-white bg-transparent px-2 py-1 border-2 border-indigo-500 rounded-md outline-none min-w-[200px]"
                 style={{ width: `${Math.max(200, newName.length * 9 + 20)}px` }}
               />
@@ -676,6 +739,16 @@ export const Editor: React.FC = () => {
             title="Export drawing"
           >
             <Download size={20} />
+          </button>
+
+          {/* Share Button */}
+          <button
+            onClick={() => setIsShareOpen(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-medium transition-colors"
+            title="Share drawing"
+          >
+            <Share2 size={16} />
+            Share
           </button>
 
           <div className="h-6 w-px bg-gray-300 dark:bg-gray-700" />
@@ -738,6 +811,15 @@ export const Editor: React.FC = () => {
         )}
         <Toaster position="bottom-center" />
       </div>
+
+      {id && (
+        <ShareDialog
+          drawingId={id}
+          drawingName={drawingName}
+          isOpen={isShareOpen}
+          onClose={() => setIsShareOpen(false)}
+        />
+      )}
     </div>
   );
 };

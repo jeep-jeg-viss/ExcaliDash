@@ -27,10 +27,23 @@ export default defineConfig({
   },
   server: {
     proxy: {
+      // Auth routes - keep /api/auth prefix (backend expects /api/auth/*)
+      "/api/auth": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+        // No rewrite - backend expects /api/auth/*
+      },
+      // Other API routes - strip /api prefix
       "/api": {
         target: "http://localhost:8000",
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ""),
+      },
+      // Socket.io - proxy WebSocket connections
+      "/socket.io": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+        ws: true,
       },
     },
   },

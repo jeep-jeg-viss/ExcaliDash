@@ -5,6 +5,7 @@ export const API_URL = import.meta.env.VITE_API_URL || "/api";
 
 export const api = axios.create({
   baseURL: API_URL,
+  withCredentials: true, // Required for session cookies
 });
 
 // CSRF Token Management
@@ -66,10 +67,21 @@ api.interceptors.request.use(
   (error) => Promise.reject(error)
 );
 
-// Add response interceptor to handle CSRF token errors
+// Add response interceptor to handle CSRF token errors and 401 unauthorized
 api.interceptors.response.use(
   (response) => response,
   async (error) => {
+    // Handle 401 Unauthorized - redirect to login
+    if (error.response?.status === 401) {
+      // Only redirect if we're not already on the login/register page
+      const isAuthPage = window.location.pathname === '/login' || window.location.pathname === '/register';
+      if (!isAuthPage) {
+        // Clear any stored auth state and redirect to login
+        window.location.href = '/login';
+      }
+      return Promise.reject(error);
+    }
+
     // If we get a 403 with CSRF error, clear token and retry once
     if (
       error.response?.status === 403 &&
@@ -205,4 +217,56 @@ export const getLibrary = async () => {
 export const updateLibrary = async (items: any[]) => {
   const response = await api.put<{ items: any[] }>("/library", { items });
   return response.data.items;
+};
+
+// --- Share Links ---
+
+import type { ShareLink, SharedDrawing } from "../types";
+
+export const createShareLink = async (
+  drawingId: string,
+  options: { permission?: "view" | "edit"; expiresIn?: number | null }
+) => {
+  const response = await api.post<ShareLink>(
+    `/drawings/${drawingId}/share`,
+    options
+  );
+  return response.data;
+};
+
+export const getShareLinks = async (drawingId: string) => {
+  const response = await api.get<ShareLink[]>(`/drawings/${drawingId}/share`);
+  return response.data;
+};
+
+export const updateShareLink = async (
+  linkId: string,
+  data: { permission?: string; isActive?: boolean; expiresIn?: number | null }
+) => {
+  const response = await api.put<ShareLink>(`/share-links/${linkId}`, data);
+  return response.data;
+};
+
+export const deleteShareLink = async (linkId: string) => {
+  const response = await api.delete<{ success: true }>(
+    `/share-links/${linkId}`
+  );
+  return response.data;
+};
+
+// Public shared drawing access (no CSRF needed - uses plain axios)
+export const getSharedDrawing = async (token: string) => {
+  const response = await axios.get<SharedDrawing>(`${API_URL}/shared/${token}`);
+  return response.data;
+};
+
+export const updateSharedDrawing = async (
+  token: string,
+  data: { elements?: any[]; appState?: any; files?: any }
+) => {
+  const response = await axios.put<SharedDrawing>(
+    `${API_URL}/shared/${token}`,
+    data
+  );
+  return response.data;
 };

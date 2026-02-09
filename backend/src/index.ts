@@ -10,7 +10,9 @@ import { Worker } from "worker_threads";
 import multer from "multer";
 import archiver from "archiver";
 import { z } from "zod";
-import { PrismaClient, Prisma } from "./generated/client";
+import { toNodeHandler, fromNodeHeaders } from "better-auth/node";
+import { auth, prisma } from "./auth";
+import type { Prisma } from "./generated/client";
 import {
   sanitizeDrawingData,
   validateImportedDrawing,
@@ -155,8 +157,15 @@ const io = new Server(httpServer, {
     credentials: true,
   },
   maxHttpBufferSize: 1e8,
+  // Prefer WebSocket for lower latency; fall back to polling
+  transports: ['websocket', 'polling'],
+  // Reduce ping interval/timeout for faster disconnect detection
+  pingInterval: 10000,
+  pingTimeout: 5000,
+  // Allow binary data for efficiency
+  perMessageDeflate: false,
 });
-const prisma = new PrismaClient();
+
 const parseJsonField = <T>(
   rawValue: string | null | undefined,
   fallback: T
@@ -184,11 +193,13 @@ type DrawingsCacheEntry = { body: Buffer; expiresAt: number };
 const drawingsCache = new Map<string, DrawingsCacheEntry>();
 
 const buildDrawingsCacheKey = (keyParts: {
+  userId: string;
   searchTerm: string;
   collectionFilter: string;
   includeData: boolean;
 }) =>
   JSON.stringify([
+    keyParts.userId,
     keyParts.searchTerm,
     keyParts.collectionFilter,
     keyParts.includeData ? "full" : "summary",
@@ -255,6 +266,11 @@ app.use(
     exposedHeaders: ["x-csrf-token"],
   })
 );
+
+// Mount Better Auth handler BEFORE express.json() middleware
+// Better-Auth needs to parse its own requests
+app.all("/api/auth/{*any}", toNodeHandler(auth));
+
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
@@ -318,6 +334,11 @@ const RATE_LIMIT_MAX_REQUESTS = (() => {
 })();
 
 app.use((req, res, next) => {
+  // Skip rate limiting for auth routes (Better-Auth handles its own)
+  if (req.path.startsWith("/api/auth")) {
+    return next();
+  }
+
   const ip = req.ip || req.connection.remoteAddress || "unknown";
   const now = Date.now();
   const clientData = requestCounts.get(ip);
@@ -414,6 +435,11 @@ const csrfProtectionMiddleware = (
   res: express.Response,
   next: express.NextFunction
 ) => {
+  // Skip CSRF validation for auth routes (Better-Auth handles its own CSRF)
+  if (req.path.startsWith("/api/auth")) {
+    return next();
+  }
+
   // Skip CSRF validation for safe methods (GET, HEAD, OPTIONS)
   // Note: /csrf-token is a GET endpoint, so it's automatically exempt
   const safeMethods = ["GET", "HEAD", "OPTIONS"];
@@ -474,6 +500,337 @@ const csrfProtectionMiddleware = (
 
 // Apply CSRF protection to all routes
 app.use(csrfProtectionMiddleware);
+
+// ==========================================
+// Authentication Middleware
+// ==========================================
+
+interface AuthenticatedRequest extends express.Request {
+  user?: {
+    id: string;
+    email: string;
+    name: string;
+    role: string | null;
+    banned: boolean | null;
+  };
+  session?: {
+    id: string;
+    userId: string;
+    expiresAt: Date;
+  };
+}
+
+// Middleware to require authentication
+const requireAuth = async (
+  req: AuthenticatedRequest,
+  res: express.Response,
+  next: express.NextFunction
+) => {
+  try {
+    const session = await auth.api.getSession({
+      headers: fromNodeHeaders(req.headers),
+    });
+
+    if (!session) {
+      return res.status(401).json({
+        error: "Unauthorized",
+        message: "You must be logged in to access this resource",
+      });
+    }
+
+    // Check if user is banned
+    if (session.user.banned) {
+      return res.status(403).json({
+        error: "Forbidden",
+        message: "Your account has been banned",
+      });
+    }
+
+    req.user = {
+      id: session.user.id,
+      email: session.user.email,
+      name: session.user.name,
+      role: session.user.role ?? null,
+      banned: session.user.banned ?? null,
+    };
+    req.session = {
+      id: session.session.id,
+      userId: session.session.userId,
+      expiresAt: session.session.expiresAt,
+    };
+
+    next();
+  } catch (error) {
+    console.error("Auth middleware error:", error);
+    return res.status(401).json({
+      error: "Unauthorized",
+      message: "Authentication failed",
+    });
+  }
+};
+
+// Middleware to require admin role
+const requireAdmin = async (
+  req: AuthenticatedRequest,
+  res: express.Response,
+  next: express.NextFunction
+) => {
+  // First run requireAuth
+  await requireAuth(req, res, () => {
+    if (!req.user) {
+      return; // requireAuth already sent response
+    }
+
+    if (req.user.role !== "admin") {
+      return res.status(403).json({
+        error: "Forbidden",
+        message: "Admin access required",
+      });
+    }
+
+    next();
+  });
+};
+
+// ==========================================
+// App Settings Endpoints
+// ==========================================
+
+// Get app settings (public - needed for login page)
+app.get("/settings/app", async (req, res) => {
+  try {
+    const settings = await prisma.appSettings.findUnique({
+      where: { id: "default" },
+    });
+
+    // Check if this is first time setup (no users exist)
+    const userCount = await prisma.user.count();
+    const isFirstTimeSetup = userCount === 0;
+
+    res.json({
+      signupsDisabled: settings?.signupsDisabled ?? false,
+      isFirstTimeSetup,
+    });
+  } catch (error) {
+    console.error("Failed to fetch app settings:", error);
+    res.status(500).json({ error: "Failed to fetch app settings" });
+  }
+});
+
+// Update app settings (admin only)
+app.put("/settings/app", requireAdmin as any, async (req: AuthenticatedRequest, res) => {
+  try {
+    const { signupsDisabled } = req.body;
+
+    const settings = await prisma.appSettings.upsert({
+      where: { id: "default" },
+      update: { signupsDisabled: Boolean(signupsDisabled) },
+      create: { id: "default", signupsDisabled: Boolean(signupsDisabled) },
+    });
+
+    res.json(settings);
+  } catch (error) {
+    console.error("Failed to update app settings:", error);
+    res.status(500).json({ error: "Failed to update app settings" });
+  }
+});
+
+// ==========================================
+// Admin User Management Endpoints
+// ==========================================
+
+// List all users (admin only)
+app.get("/admin/users", requireAdmin as any, async (req: AuthenticatedRequest, res) => {
+  try {
+    const users = await prisma.user.findMany({
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        banned: true,
+        banReason: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+      orderBy: { createdAt: "desc" },
+    });
+
+    res.json(users);
+  } catch (error) {
+    console.error("Failed to list users:", error);
+    res.status(500).json({ error: "Failed to list users" });
+  }
+});
+
+// Create user (admin only)
+app.post("/admin/users", requireAdmin as any, async (req: AuthenticatedRequest, res) => {
+  try {
+    const { email, password, name, role } = req.body;
+
+    if (!email || !password || !name) {
+      return res.status(400).json({
+        error: "Missing required fields",
+        message: "Email, password, and name are required",
+      });
+    }
+
+    // Use Better-Auth's admin API to create user
+    const result = await auth.api.createUser({
+      body: {
+        email,
+        password,
+        name,
+        role: role || "user",
+      },
+    });
+
+    res.json(result);
+  } catch (error: any) {
+    console.error("Failed to create user:", error);
+    res.status(400).json({
+      error: "Failed to create user",
+      message: error.message || "Unknown error",
+    });
+  }
+});
+
+// Update user role (admin only)
+app.put("/admin/users/:userId/role", requireAdmin as any, async (req: AuthenticatedRequest, res) => {
+  try {
+    const { userId } = req.params;
+    const { role } = req.body;
+
+    if (!role || !["user", "admin"].includes(role)) {
+      return res.status(400).json({
+        error: "Invalid role",
+        message: "Role must be 'user' or 'admin'",
+      });
+    }
+
+    // Prevent admin from removing their own admin role
+    if (userId === req.user!.id && role !== "admin") {
+      return res.status(400).json({
+        error: "Cannot demote self",
+        message: "You cannot remove your own admin role",
+      });
+    }
+
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: { role },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        banned: true,
+      },
+    });
+
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Failed to update user role:", error);
+    res.status(500).json({ error: "Failed to update user role" });
+  }
+});
+
+// Ban user (admin only)
+app.post("/admin/users/:userId/ban", requireAdmin as any, async (req: AuthenticatedRequest, res) => {
+  try {
+    const { userId } = req.params;
+    const { reason } = req.body;
+
+    // Prevent admin from banning themselves
+    if (userId === req.user!.id) {
+      return res.status(400).json({
+        error: "Cannot ban self",
+        message: "You cannot ban your own account",
+      });
+    }
+
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: {
+        banned: true,
+        banReason: reason || "No reason provided",
+      },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        banned: true,
+        banReason: true,
+      },
+    });
+
+    // Revoke all sessions for banned user
+    await prisma.session.deleteMany({
+      where: { userId },
+    });
+
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Failed to ban user:", error);
+    res.status(500).json({ error: "Failed to ban user" });
+  }
+});
+
+// Unban user (admin only)
+app.post("/admin/users/:userId/unban", requireAdmin as any, async (req: AuthenticatedRequest, res) => {
+  try {
+    const { userId } = req.params;
+
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: {
+        banned: false,
+        banReason: null,
+      },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        banned: true,
+      },
+    });
+
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Failed to unban user:", error);
+    res.status(500).json({ error: "Failed to unban user" });
+  }
+});
+
+// Delete user (admin only)
+app.delete("/admin/users/:userId", requireAdmin as any, async (req: AuthenticatedRequest, res) => {
+  try {
+    const { userId } = req.params;
+
+    // Prevent admin from deleting themselves
+    if (userId === req.user!.id) {
+      return res.status(400).json({
+        error: "Cannot delete self",
+        message: "You cannot delete your own account",
+      });
+    }
+
+    await prisma.user.delete({
+      where: { id: userId },
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Failed to delete user:", error);
+    res.status(500).json({ error: "Failed to delete user" });
+  }
+});
+
+// ==========================================
+// Zod Schemas
+// ==========================================
 
 const filesFieldSchema = z
   .union([z.record(z.string(), z.any()), z.null()])
@@ -653,7 +1010,11 @@ const removeFileIfExists = async (filePath?: string) => {
   }
 };
 
-interface User {
+// ==========================================
+// Socket.IO for Real-time Collaboration
+// ==========================================
+
+interface SocketUser {
   id: string;
   name: string;
   initials: string;
@@ -662,7 +1023,7 @@ interface User {
   isActive: boolean;
 }
 
-const roomUsers = new Map<string, User[]>();
+const roomUsers = new Map<string, SocketUser[]>();
 
 io.on("connection", (socket) => {
   socket.on(
@@ -672,12 +1033,12 @@ io.on("connection", (socket) => {
       user,
     }: {
       drawingId: string;
-      user: Omit<User, "socketId" | "isActive">;
+      user: Omit<SocketUser, "socketId" | "isActive">;
     }) => {
       const roomId = `drawing_${drawingId}`;
       socket.join(roomId);
 
-      const newUser: User = { ...user, socketId: socket.id, isActive: true };
+      const newUser: SocketUser = { ...user, socketId: socket.id, isActive: true };
 
       const currentUsers = roomUsers.get(roomId) || [];
       const filteredUsers = currentUsers.filter((u) => u.id !== user.id);
@@ -725,14 +1086,32 @@ io.on("connection", (socket) => {
   });
 });
 
+// ==========================================
+// API Routes
+// ==========================================
+
 app.get("/health", (req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
-app.get("/drawings", async (req, res) => {
+// Get current user info
+app.get("/me", requireAuth as any, async (req: AuthenticatedRequest, res) => {
+  res.json({
+    user: req.user,
+    session: req.session,
+  });
+});
+
+// ==========================================
+// Drawings API (Protected)
+// ==========================================
+
+app.get("/drawings", requireAuth as any, async (req: AuthenticatedRequest, res) => {
   try {
     const { search, collectionId, includeData } = req.query;
-    const where: any = {};
+    const userId = req.user!.id;
+
+    const where: any = { userId };
     const searchTerm =
       typeof search === "string" && search.trim().length > 0
         ? search.trim()
@@ -760,6 +1139,7 @@ app.get("/drawings", async (req, res) => {
         : false;
 
     const cacheKey = buildDrawingsCacheKey({
+      userId,
       searchTerm: searchTerm ?? "",
       collectionFilter: collectionFilterKey,
       includeData: shouldIncludeData,
@@ -814,11 +1194,15 @@ app.get("/drawings", async (req, res) => {
   }
 });
 
-app.get("/drawings/:id", async (req, res) => {
+app.get("/drawings/:id", requireAuth as any, async (req: AuthenticatedRequest, res) => {
   try {
     const { id } = req.params;
-    console.log("[API] Fetching drawing", { id });
-    const drawing = await prisma.drawing.findUnique({ where: { id } });
+    const userId = req.user!.id;
+
+    console.log("[API] Fetching drawing", { id, userId });
+    const drawing = await prisma.drawing.findFirst({
+      where: { id, userId },
+    });
 
     if (!drawing) {
       console.warn("[API] Drawing not found", { id });
@@ -836,8 +1220,9 @@ app.get("/drawings/:id", async (req, res) => {
   }
 });
 
-app.post("/drawings", async (req, res) => {
+app.post("/drawings", requireAuth as any, async (req: AuthenticatedRequest, res) => {
   try {
+    const userId = req.user!.id;
     const isImportedDrawing = req.headers["x-imported-file"] === "true";
 
     if (isImportedDrawing && !validateImportedDrawing(req.body)) {
@@ -866,6 +1251,7 @@ app.post("/drawings", async (req, res) => {
         collectionId: targetCollectionId,
         preview: payload.preview ?? null,
         files: JSON.stringify(payload.files ?? {}),
+        userId,
       },
     });
     invalidateDrawingsCache();
@@ -882,9 +1268,19 @@ app.post("/drawings", async (req, res) => {
   }
 });
 
-app.put("/drawings/:id", async (req, res) => {
+app.put("/drawings/:id", requireAuth as any, async (req: AuthenticatedRequest, res) => {
   try {
     const { id } = req.params;
+    const userId = req.user!.id;
+
+    // Verify ownership
+    const existing = await prisma.drawing.findFirst({
+      where: { id, userId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ error: "Drawing not found" });
+    }
 
     const parsed = drawingUpdateSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -935,9 +1331,20 @@ app.put("/drawings/:id", async (req, res) => {
   }
 });
 
-app.delete("/drawings/:id", async (req, res) => {
+app.delete("/drawings/:id", requireAuth as any, async (req: AuthenticatedRequest, res) => {
   try {
     const { id } = req.params;
+    const userId = req.user!.id;
+
+    // Verify ownership
+    const existing = await prisma.drawing.findFirst({
+      where: { id, userId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ error: "Drawing not found" });
+    }
+
     await prisma.drawing.delete({ where: { id } });
     invalidateDrawingsCache();
     res.json({ success: true });
@@ -946,10 +1353,14 @@ app.delete("/drawings/:id", async (req, res) => {
   }
 });
 
-app.post("/drawings/:id/duplicate", async (req, res) => {
+app.post("/drawings/:id/duplicate", requireAuth as any, async (req: AuthenticatedRequest, res) => {
   try {
     const { id } = req.params;
-    const original = await prisma.drawing.findUnique({ where: { id } });
+    const userId = req.user!.id;
+
+    const original = await prisma.drawing.findFirst({
+      where: { id, userId },
+    });
 
     if (!original) {
       return res.status(404).json({ error: "Original drawing not found" });
@@ -963,6 +1374,7 @@ app.post("/drawings/:id/duplicate", async (req, res) => {
         files: original.files,
         collectionId: original.collectionId,
         version: 1,
+        userId,
       },
     });
     invalidateDrawingsCache();
@@ -978,9 +1390,273 @@ app.post("/drawings/:id/duplicate", async (req, res) => {
   }
 });
 
-app.get("/collections", async (req, res) => {
+// ==========================================
+// Share Links API
+// ==========================================
+
+// Create a share link for a drawing
+app.post("/drawings/:id/share", requireAuth as any, async (req: AuthenticatedRequest, res) => {
   try {
+    const { id } = req.params;
+    const userId = req.user!.id;
+    const { permission = "view", expiresIn } = req.body;
+
+    // Validate permission
+    if (!["view", "edit"].includes(permission)) {
+      return res.status(400).json({ error: "Permission must be 'view' or 'edit'" });
+    }
+
+    // Verify ownership
+    const drawing = await prisma.drawing.findFirst({
+      where: { id, userId },
+    });
+    if (!drawing) {
+      return res.status(404).json({ error: "Drawing not found" });
+    }
+
+    // Calculate expiry
+    let expiresAt: Date | null = null;
+    if (expiresIn) {
+      const hours = parseInt(expiresIn, 10);
+      if (isNaN(hours) || hours <= 0) {
+        return res.status(400).json({ error: "expiresIn must be a positive number of hours" });
+      }
+      expiresAt = new Date(Date.now() + hours * 60 * 60 * 1000);
+    }
+
+    const shareLink = await prisma.shareLink.create({
+      data: {
+        drawingId: id,
+        createdBy: userId,
+        permission,
+        expiresAt,
+      },
+    });
+
+    res.json({
+      id: shareLink.id,
+      token: shareLink.token,
+      permission: shareLink.permission,
+      expiresAt: shareLink.expiresAt,
+      isActive: shareLink.isActive,
+      createdAt: shareLink.createdAt,
+    });
+  } catch (error) {
+    console.error("Failed to create share link:", error);
+    res.status(500).json({ error: "Failed to create share link" });
+  }
+});
+
+// List share links for a drawing
+app.get("/drawings/:id/share", requireAuth as any, async (req: AuthenticatedRequest, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user!.id;
+
+    // Verify ownership
+    const drawing = await prisma.drawing.findFirst({
+      where: { id, userId },
+    });
+    if (!drawing) {
+      return res.status(404).json({ error: "Drawing not found" });
+    }
+
+    const links = await prisma.shareLink.findMany({
+      where: { drawingId: id },
+      orderBy: { createdAt: "desc" },
+    });
+
+    res.json(links.map(link => ({
+      id: link.id,
+      token: link.token,
+      permission: link.permission,
+      expiresAt: link.expiresAt,
+      isActive: link.isActive,
+      createdAt: link.createdAt,
+    })));
+  } catch (error) {
+    console.error("Failed to list share links:", error);
+    res.status(500).json({ error: "Failed to list share links" });
+  }
+});
+
+// Update a share link (toggle active, change permission/expiry)
+app.put("/share-links/:linkId", requireAuth as any, async (req: AuthenticatedRequest, res) => {
+  try {
+    const { linkId } = req.params;
+    const userId = req.user!.id;
+    const { permission, isActive, expiresIn } = req.body;
+
+    const link = await prisma.shareLink.findUnique({
+      where: { id: linkId },
+    });
+    if (!link || link.createdBy !== userId) {
+      return res.status(404).json({ error: "Share link not found" });
+    }
+
+    const data: any = {};
+    if (permission !== undefined) {
+      if (!["view", "edit"].includes(permission)) {
+        return res.status(400).json({ error: "Permission must be 'view' or 'edit'" });
+      }
+      data.permission = permission;
+    }
+    if (isActive !== undefined) {
+      data.isActive = Boolean(isActive);
+    }
+    if (expiresIn !== undefined) {
+      if (expiresIn === null) {
+        data.expiresAt = null;
+      } else {
+        const hours = parseInt(expiresIn, 10);
+        if (isNaN(hours) || hours <= 0) {
+          return res.status(400).json({ error: "expiresIn must be a positive number of hours" });
+        }
+        data.expiresAt = new Date(Date.now() + hours * 60 * 60 * 1000);
+      }
+    }
+
+    const updated = await prisma.shareLink.update({
+      where: { id: linkId },
+      data,
+    });
+
+    res.json({
+      id: updated.id,
+      token: updated.token,
+      permission: updated.permission,
+      expiresAt: updated.expiresAt,
+      isActive: updated.isActive,
+      createdAt: updated.createdAt,
+    });
+  } catch (error) {
+    console.error("Failed to update share link:", error);
+    res.status(500).json({ error: "Failed to update share link" });
+  }
+});
+
+// Delete a share link
+app.delete("/share-links/:linkId", requireAuth as any, async (req: AuthenticatedRequest, res) => {
+  try {
+    const { linkId } = req.params;
+    const userId = req.user!.id;
+
+    const link = await prisma.shareLink.findUnique({
+      where: { id: linkId },
+    });
+    if (!link || link.createdBy !== userId) {
+      return res.status(404).json({ error: "Share link not found" });
+    }
+
+    await prisma.shareLink.delete({ where: { id: linkId } });
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Failed to delete share link:", error);
+    res.status(500).json({ error: "Failed to delete share link" });
+  }
+});
+
+// Public: Access a shared drawing via token (no auth required)
+app.get("/shared/:token", async (req, res) => {
+  try {
+    const { token } = req.params;
+
+    const link = await prisma.shareLink.findUnique({
+      where: { token },
+      include: { drawing: true },
+    });
+
+    if (!link) {
+      return res.status(404).json({ error: "Shared link not found" });
+    }
+
+    if (!link.isActive) {
+      return res.status(403).json({ error: "This share link has been deactivated" });
+    }
+
+    if (link.expiresAt && new Date() > link.expiresAt) {
+      return res.status(403).json({ error: "This share link has expired" });
+    }
+
+    const drawing = link.drawing;
+    res.json({
+      id: drawing.id,
+      name: drawing.name,
+      elements: JSON.parse(drawing.elements),
+      appState: JSON.parse(drawing.appState),
+      files: JSON.parse(drawing.files || "{}"),
+      permission: link.permission,
+      version: drawing.version,
+    });
+  } catch (error) {
+    console.error("Failed to access shared drawing:", error);
+    res.status(500).json({ error: "Failed to access shared drawing" });
+  }
+});
+
+// Public: Update a shared drawing (edit permission required, no auth required)
+app.put("/shared/:token", async (req, res) => {
+  try {
+    const { token } = req.params;
+
+    const link = await prisma.shareLink.findUnique({
+      where: { token },
+      include: { drawing: true },
+    });
+
+    if (!link) {
+      return res.status(404).json({ error: "Shared link not found" });
+    }
+
+    if (!link.isActive) {
+      return res.status(403).json({ error: "This share link has been deactivated" });
+    }
+
+    if (link.expiresAt && new Date() > link.expiresAt) {
+      return res.status(403).json({ error: "This share link has expired" });
+    }
+
+    if (link.permission !== "edit") {
+      return res.status(403).json({ error: "This share link is view-only" });
+    }
+
+    const { elements, appState, files } = req.body;
+    const data: any = { version: { increment: 1 } };
+    if (elements !== undefined) data.elements = JSON.stringify(elements);
+    if (appState !== undefined) data.appState = JSON.stringify(appState);
+    if (files !== undefined) data.files = JSON.stringify(files);
+
+    const updated = await prisma.drawing.update({
+      where: { id: link.drawingId },
+      data,
+    });
+    invalidateDrawingsCache();
+
+    res.json({
+      id: updated.id,
+      name: updated.name,
+      elements: JSON.parse(updated.elements),
+      appState: JSON.parse(updated.appState),
+      files: JSON.parse(updated.files || "{}"),
+      permission: link.permission,
+      version: updated.version,
+    });
+  } catch (error) {
+    console.error("Failed to update shared drawing:", error);
+    res.status(500).json({ error: "Failed to update shared drawing" });
+  }
+});
+
+// ==========================================
+// Collections API (Protected)
+// ==========================================
+
+app.get("/collections", requireAuth as any, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.id;
+
     const collections = await prisma.collection.findMany({
+      where: { userId },
       orderBy: { createdAt: "desc" },
     });
     res.json(collections);
@@ -990,11 +1666,13 @@ app.get("/collections", async (req, res) => {
   }
 });
 
-app.post("/collections", async (req, res) => {
+app.post("/collections", requireAuth as any, async (req: AuthenticatedRequest, res) => {
   try {
+    const userId = req.user!.id;
     const { name } = req.body;
+
     const newCollection = await prisma.collection.create({
-      data: { name },
+      data: { name, userId },
     });
     res.json(newCollection);
   } catch (error) {
@@ -1002,10 +1680,21 @@ app.post("/collections", async (req, res) => {
   }
 });
 
-app.put("/collections/:id", async (req, res) => {
+app.put("/collections/:id", requireAuth as any, async (req: AuthenticatedRequest, res) => {
   try {
     const { id } = req.params;
+    const userId = req.user!.id;
     const { name } = req.body;
+
+    // Verify ownership
+    const existing = await prisma.collection.findFirst({
+      where: { id, userId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ error: "Collection not found" });
+    }
+
     const updatedCollection = await prisma.collection.update({
       where: { id },
       data: { name },
@@ -1016,12 +1705,23 @@ app.put("/collections/:id", async (req, res) => {
   }
 });
 
-app.delete("/collections/:id", async (req, res) => {
+app.delete("/collections/:id", requireAuth as any, async (req: AuthenticatedRequest, res) => {
   try {
     const { id } = req.params;
+    const userId = req.user!.id;
+
+    // Verify ownership
+    const existing = await prisma.collection.findFirst({
+      where: { id, userId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ error: "Collection not found" });
+    }
+
     await prisma.$transaction([
       prisma.drawing.updateMany({
-        where: { collectionId: id },
+        where: { collectionId: id, userId },
         data: { collectionId: null },
       }),
       prisma.collection.delete({
@@ -1036,7 +1736,11 @@ app.delete("/collections/:id", async (req, res) => {
   }
 });
 
-app.get("/library", async (req, res) => {
+// ==========================================
+// Library API (Protected)
+// ==========================================
+
+app.get("/library", requireAuth as any, async (req: AuthenticatedRequest, res) => {
   try {
     const library = await prisma.library.findUnique({
       where: { id: "default" },
@@ -1055,7 +1759,7 @@ app.get("/library", async (req, res) => {
   }
 });
 
-app.put("/library", async (req, res) => {
+app.put("/library", requireAuth as any, async (req: AuthenticatedRequest, res) => {
   try {
     const { items } = req.body;
 
@@ -1083,7 +1787,11 @@ app.put("/library", async (req, res) => {
   }
 });
 
-app.get("/export", async (req, res) => {
+// ==========================================
+// Export/Import API (Protected)
+// ==========================================
+
+app.get("/export", requireAdmin as any, async (req: AuthenticatedRequest, res) => {
   try {
     const formatParam =
       typeof req.query.format === "string"
@@ -1113,9 +1821,12 @@ app.get("/export", async (req, res) => {
   }
 });
 
-app.get("/export/json", async (req, res) => {
+app.get("/export/json", requireAuth as any, async (req: AuthenticatedRequest, res) => {
   try {
+    const userId = req.user!.id;
+
     const drawings = await prisma.drawing.findMany({
+      where: { userId },
       include: {
         collection: true,
       },
@@ -1202,7 +1913,7 @@ ${Object.entries(drawingsByCollection)
   }
 });
 
-app.post("/import/sqlite/verify", upload.single("db"), async (req, res) => {
+app.post("/import/sqlite/verify", requireAdmin as any, upload.single("db"), async (req: AuthenticatedRequest, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded" });
@@ -1226,7 +1937,7 @@ app.post("/import/sqlite/verify", upload.single("db"), async (req, res) => {
   }
 });
 
-app.post("/import/sqlite", upload.single("db"), async (req, res) => {
+app.post("/import/sqlite", requireAdmin as any, upload.single("db"), async (req: AuthenticatedRequest, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded" });
@@ -1284,24 +1995,34 @@ app.post("/import/sqlite", upload.single("db"), async (req, res) => {
   }
 });
 
+// ==========================================
+// Initialization
+// ==========================================
+
 const ensureTrashCollection = async () => {
+  // Trash is now per-user, so we don't create a global one
+  console.log("Trash collections are now per-user");
+};
+
+const ensureAppSettings = async () => {
   try {
-    const trash = await prisma.collection.findUnique({
-      where: { id: "trash" },
+    const settings = await prisma.appSettings.findUnique({
+      where: { id: "default" },
     });
-    if (!trash) {
-      await prisma.collection.create({
-        data: { id: "trash", name: "Trash" },
+    if (!settings) {
+      await prisma.appSettings.create({
+        data: { id: "default", signupsDisabled: false },
       });
-      console.log("Created Trash collection");
+      console.log("Created default app settings");
     }
   } catch (error) {
-    console.error("Failed to ensure Trash collection:", error);
+    console.error("Failed to ensure app settings:", error);
   }
 };
 
 httpServer.listen(PORT, async () => {
   await initializeUploadDir();
   await ensureTrashCollection();
+  await ensureAppSettings();
   console.log(`Server running on port ${PORT}`);
 });

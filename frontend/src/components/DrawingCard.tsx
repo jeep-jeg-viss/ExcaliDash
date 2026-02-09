@@ -174,12 +174,17 @@ export const DrawingCard: React.FC<DrawingCardProps> = ({
     return () => document.removeEventListener('click', handleClick);
   }, []);
 
+  const commitRename = useCallback((name: string) => {
+    const trimmed = name.trim();
+    if (trimmed) {
+      onRename(drawing.id, trimmed);
+    }
+    setIsRenaming(false);
+  }, [drawing.id, onRename]);
+
   const handleRenameSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (newName.trim()) {
-      onRename(drawing.id, newName);
-      setIsRenaming(false);
-    }
+    commitRename(newName);
   };
 
   const handleContextMenu = (e: React.MouseEvent) => {
@@ -267,7 +272,8 @@ export const DrawingCard: React.FC<DrawingCardProps> = ({
                 type="text"
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
-                onBlur={() => setIsRenaming(false)}
+                onBlur={() => commitRename(newName)}
+                onKeyDown={(e) => { if (e.key === 'Escape') { setIsRenaming(false); } }}
                 onDragStart={(e) => e.stopPropagation()}
                 onMouseDown={(e) => e.stopPropagation()}
                 className="w-full px-2 py-1 -ml-2 text-base font-bold text-slate-900 dark:text-white border-2 border-black dark:border-neutral-600 rounded-lg focus:outline-none shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,0.2)] bg-white dark:bg-neutral-800"
