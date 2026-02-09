@@ -8,6 +8,12 @@ services:
       - DATABASE_URL=file:/app/prisma/dev.db
       - PORT=8000
       - NODE_ENV=production
+      # Comma-separated allowed frontend origins (set to your public domain for reverse proxy setups)
+      - FRONTEND_URL=http://localhost:6767
+      # Base URL for auth (set to your public URL when behind a reverse proxy)
+      # - BETTER_AUTH_BASE_URL=https://yourdomain.com
+      # Proxy trust: true for most reverse proxy setups (Caddy, nginx, Traefik)
+      # - TRUST_PROXY=true
       # Required for horizontal scaling (k8s): uncomment and set to same value on all instances
       # - CSRF_SECRET=${CSRF_SECRET}
     volumes:

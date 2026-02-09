@@ -269,7 +269,13 @@ app.use(
 
 // Mount Better Auth handler BEFORE express.json() middleware
 // Better-Auth needs to parse its own requests
+// Mount on both paths to handle reverse proxies that strip /api/ prefix
 app.all("/api/auth/{*any}", toNodeHandler(auth));
+app.all("/auth/{*any}", (req, res) => {
+  // Rewrite /auth/* to /api/auth/* so better-auth's basePath matches
+  req.url = `/api${req.url}`;
+  toNodeHandler(auth)(req, res);
+});
 
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
@@ -436,7 +442,8 @@ const csrfProtectionMiddleware = (
   next: express.NextFunction
 ) => {
   // Skip CSRF validation for auth routes (Better-Auth handles its own CSRF)
-  if (req.path.startsWith("/api/auth")) {
+  // Check both paths to handle reverse proxies that strip /api/ prefix
+  if (req.path.startsWith("/api/auth") || req.path.startsWith("/auth")) {
     return next();
   }
 
